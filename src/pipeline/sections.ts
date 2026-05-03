@@ -19,7 +19,26 @@ export const SECTION_IDS = {
   MEMORY: "memory",
   SKILLS: "skills",
   DYNAMIC: "dynamic",
+  REFLECTION: "reflection",
 } as const;
+
+export function buildReflectionPrompt(toolName: string, args: any): string {
+  return `【内心独白 / 风险评估】
+你正准备执行一项具有潜在风险的操作：调用工具 "${toolName}"。
+参数为: ${JSON.stringify(args)}
+
+请在内心进行预演评估（无需输出到最终回复，仅作为逻辑判定依据）：
+1. 该操作是否具有破坏性？（如删除文件、强制重启、网络请求敏感地址）
+2. 该操作是否与之前的用户指令冲突？
+3. 如果执行失败，是否有恢复预案？
+
+请输出 JSON 格式判定：
+{
+  "risk_level": "low" | "medium" | "high",
+  "decision": "proceed" | "ask" | "block",
+  "reason": "简短理由"
+}`;
+}
 
 // --- 内置 Section Builders ---
 

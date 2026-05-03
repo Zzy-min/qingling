@@ -106,6 +106,37 @@ export async function runSetup() {
     envLines.push(`QINGLING_VISION_ENDPOINT=${pEndpoint}`);
   }
 
+  // --- v0.4 进阶特性配置 ---
+  console.log("\n--- 进阶特性配置 (可选) ---");
+  
+  const enableDashboard = await rl.question("是否开启 Web 观测控制台 (Dashboard)? (y/N): ");
+  if (enableDashboard.trim().toLowerCase() === 'y') {
+    envLines.push("QINGLING_FEATURES_DASHBOARD=true");
+    envLines.push("QINGLING_METRICS_ENABLED=true"); // Dashboard 强依赖 Metrics 收集数据
+    const port = await rl.question("  - 请设置端口 [默认: 9999]: ");
+    if (port.trim()) envLines.push(`QINGLING_DASHBOARD_PORT=${port.trim()}`);
+  }
+
+  const enableSemantic = await rl.question("是否开启语义记忆 (需要 Embedding 支持)? (y/N): ");
+  if (enableSemantic.trim().toLowerCase() === 'y') {
+    envLines.push("QINGLING_FEATURES_SEMANTIC_MEMORY=true");
+  }
+
+  const enableWorkflow = await rl.question("是否开启状态机编排与 Checkpoint (断点续传)? (Y/n): ");
+  if (enableWorkflow.trim().toLowerCase() !== 'n') {
+    envLines.push("QINGLING_FEATURES_WORKFLOW_RUNTIME=true");
+  }
+
+  const enableSpecBoost = await rl.question("是否开启工具规范增强 (防幻觉)? (Y/n): ");
+  if (enableSpecBoost.trim().toLowerCase() !== 'n') {
+    envLines.push("QINGLING_FEATURES_TOOL_SPEC_BOOST=true");
+  }
+
+  const enableDiscovery = await rl.question("是否开启动态技能发现? (Y/n): ");
+  if (enableDiscovery.trim().toLowerCase() !== 'n') {
+    envLines.push("QINGLING_FEATURES_DYNAMIC_DISCOVERY=true");
+  }
+
   const globalEnvPath = path.join(os.homedir(), ".qingling", ".env");
   await fs.mkdir(path.dirname(globalEnvPath), { recursive: true });
   await fs.writeFile(globalEnvPath, envLines.join("\n") + "\n", "utf-8");

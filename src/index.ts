@@ -149,115 +149,150 @@ async function main() {
   const agent = new AgentLoop(agentConfig);
   await agent.waitForInit();
 
-  if (decision.mode === "workflow") {
-    const [sub, runId] = decision.subArgs;
-    if (sub === "resume" && runId) {
-      console.error(`🔄 正在从 Checkpoint 恢复: ${runId}`);
-      try {
+  try {
+    if (decision.mode === "workflow") {
+      const [sub, runId] = decision.subArgs;
+      if (sub === "resume" && runId) {
+        console.error(`🔄 正在从 Checkpoint 恢复: ${runId}`);
         const checkpoint = await agent.getWorkflowRuntime().resume(runId);
         agent.syncWorkflowState(checkpoint);
         const response = await agent.run();
         console.log(response);
         return;
-      } catch (err) {
-        console.error(formatCliError("WORKFLOW_RESUME_FAILED", (err as Error).message));
-        process.exit(1);
       }
+      console.error("用法: qingling workflow resume <run_id>");
+      process.exit(1);
     }
-    console.error("用法: qingling workflow resume <run_id>");
-    process.exit(1);
-  }
 
-  if (decision.mode === "memory") {
-    const [sub] = decision.subArgs;
-    if (sub === "reindex") {
-      console.error("🧠 正在重新构建语义记忆向量索引...");
-      try {
+    if (decision.mode === "memory") {
+      const [sub] = decision.subArgs;
+      if (sub === "reindex") {
+        console.error("🧠 正在重新构建语义记忆向量索引...");
         await agent.getMemoryStore().rebuildSemanticIndex();
         console.error("✅ 索引重建完成");
         return;
-      } catch (err) {
-        console.error(formatCliError("MEMORY_REINDEX_FAILED", (err as Error).message));
-        process.exit(1);
       }
-    }
-    console.error("用法: qingling memory reindex [--full]");
-    process.exit(1);
-  }
-
-  if (decision.mode === "dashboard") {
-    const [sub] = decision.subArgs;
-    if (sub === "start") {
-      // Dashboard already starts if enabled in init, but we can force it or keep process alive
-      console.error("📊 Dashboard 运行中。按 Ctrl+C 退出。");
-      await new Promise(() => {}); // Keep alive
-      return;
-    }
-    console.error("用法: qingling dashboard start");
-    process.exit(1);
-  }
-
-  if (decision.mode === "discovery") {
-    const [sub] = decision.subArgs;
-    if (sub === "sync") {
-      console.error("🔍 正在同步动态插件与技能...");
-      await agent.getDiscoveryRegistry().syncAll();
-      const items = agent.getDiscoveryRegistry().getAllItems();
-      console.error(`✅ 同步完成，共发现 ${items.length} 个项目:`);
-      items.forEach(it => console.error(`  - [${it.manifest.type}] ${it.manifest.name} v${it.manifest.version}`));
-      return;
-    }
-    console.error("用法: qingling discovery sync");
-    process.exit(1);
-  }
-
-  if (decision.mode === "run") {
-    try {
-      const channel = resolveRunModeChannel(decision.mode, loaded.config.channels);
-      if (channel) {
-        await channel.start();
-        agent.setChannel(channel);
-      }
-    } catch (err) {
-      if (err instanceof CliChannelBootstrapError) {
-        console.error(formatCliError(err.code, err.message));
-        process.exit(1);
-      }
-      console.error(
-        formatCliError(
-          "CLI_CHANNEL_INIT_FAILED",
-          err instanceof Error ? err.message : String(err)
-        )
-      );
+      console.error("用法: qingling memory reindex [--full]");
       process.exit(1);
     }
-  }
 
-  if (decision.mode === "chat") {
-    const repl = new StreamingREPL(agent);
-    await repl.start();
-    return;
-  }
+    if (decision.mode === "dashboard") {
+      const [sub] = decision.subArgs;
+      if (sub === "start") {
+        const port = process.env.QINGLING_DASHBOARD_PORT || "9999";
+        const ds = (agent as any).dashboardServer;
+        // 检查是否真正成功开启监听
+        if (!ds || !ds.listening) {
+           console.error(`❌ Dashboard 启动失败，请检查端口 ${port} 是否被占用。`);
+           process.exit(1);
+        }
+        console.error("📊 Dashboard 运行中。按 Ctrl+C 退出。");
+        await new Promise(() => {}); // Keep alive
+        return;
+      }
+      console.error("用法: qingling dashboard start");
+      process.exit(1);
+    }
 
-  if (decision.mode === "repl") {
-    const repl = new Repl(agent);
-    await repl.start();
-    return;
-  }
+    if (decision.mode === "discovery") {
+      const [sub] = decision.subArgs;
+      if (sub === "sync") {
+        console.error("🔍 正在同步动态插件与技能...");
+        await agent.getDiscoveryRegistry().syncAll();
+        const items = agent.getDiscoveryRegistry().getAllItems();
+        console.error(`✅ 同步完成，共发现 ${items.length} 个项目:`);
+        items.forEach(it => console.error(`  - [${it.manifest.type}] ${it.manifest.name} v${it.manifest.version}`));
+        return;
+      }
+      console.error("用法: qingling discovery sync");
+      process.exit(1);
+    }
 
-  try {
+    if (decision.mode === "mission") {
+      const [sub, ...mArgs] = decision.subArgs;
+      const manager = agent.getMissionManager();
+      
+      if (sub === "start") {
+        const task = mArgs.join(" ");
+        if (!task) {
+          console.error("用法: qingling mission start \"任务描述\"");
+          process.exit(1);
+        }
+        const mission = await manager.createMission("New Mission", task, agent.getSessionId());
+        console.error(`🚀 使命已创建并加入队列: ${mission.id}`);
+        console.error(`提示: 目前 M2 阶段使命将在当前进程执行。在 M3 中将迁移至 qinglingd 守护进程。`);
+        
+        await manager.updateStatus(mission.id, "running");
+        agent.addUserMessage(task);
+        const response = await agent.run();
+        await manager.updateStatus(mission.id, "succeeded");
+        console.log(response);
+        return;
+      }
+
+      if (sub === "list") {
+        const missions = manager.listMissions();
+        console.log("\n📋 【使命列表】");
+        console.log("-----------------------------------------");
+        if (missions.length === 0) console.log("(无)");
+        missions.forEach(m => {
+          console.log(`- [${m.status.toUpperCase()}] ${m.id} | ${m.description.slice(0, 30)}...`);
+        });
+        console.log("-----------------------------------------\n");
+        return;
+      }
+
+      console.error("用法: qingling mission start|list|show|logs");
+      process.exit(1);
+    }
+
+    if (decision.mode === "run") {
+      try {
+        const channel = resolveRunModeChannel(decision.mode, loaded.config.channels);
+        if (channel) {
+          await channel.start();
+          agent.setChannel(channel);
+        }
+      } catch (err) {
+        if (err instanceof CliChannelBootstrapError) {
+          console.error(formatCliError(err.code, err.message));
+          process.exit(1);
+        }
+        console.error(
+          formatCliError(
+            "CLI_CHANNEL_INIT_FAILED",
+            err instanceof Error ? err.message : String(err)
+          )
+        );
+        process.exit(1);
+      }
+    }
+
+    if (decision.mode === "chat") {
+      const repl = new StreamingREPL(agent);
+      await repl.start();
+      return;
+    }
+
+    if (decision.mode === "repl") {
+      const repl = new Repl(agent);
+      await repl.start();
+      return;
+    }
+
     const task = decision.task ?? "";
     agent.addUserMessage(task);
     const response = await agent.run();
     console.log(response);
-  } catch (err) {
-    console.error(formatCliError("RUN_FAILED", err instanceof Error ? err.message : String(err)));
+  } catch (err: any) {
+    const code = err.code || "RUN_FAILED";
+    console.error(formatCliError(code, err.message || String(err)));
     process.exit(1);
   } finally {
     try {
       await agent.shutdown();
     } catch {
-      // ignore shutdown cleanup failures in CLI exit path
+      // ignore
     }
   }
 }

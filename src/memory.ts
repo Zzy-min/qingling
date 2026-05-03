@@ -10,7 +10,7 @@ import { WriteAheadLog } from "./memory/wal.js";
 import type { WALEntry } from "./types.js";
 import { ProjectionWorker } from "./memory/projection-worker.js";
 import { MemoryCompactor } from "./memory/compactor.js";
-import { SemanticMemoryIndex } from "./memory/semantic-index.js";
+import { CognitiveIndex } from "./memory/cognitive-index.js";
 import { EmbeddingClient } from "./memory/embedding.js";
 
 const DEFAULT_CONFIG = {
@@ -28,8 +28,8 @@ export class PersistedMemory {
   private wal: WriteAheadLog | null = null;
   private projectionWorker: ProjectionWorker | null = null;
   
-  // v0.3 语义索引
-  private semanticIndex: SemanticMemoryIndex | null = null;
+  // v0.5 认知引擎
+  private cognitiveIndex: CognitiveIndex | null = null;
   private embeddingClient: EmbeddingClient | null = null;
 
   constructor(memoryDir: string) {
@@ -44,23 +44,23 @@ export class PersistedMemory {
     this.projectionWorker = new ProjectionWorker(wal, {
       applyEntry: (entry) => this.applyWALEntry(entry),
       getEntries: () => this.entries,
-      onCheckpoint: async (entries) => this.syncSemanticIndex(entries),
+      onCheckpoint: async (entries) => this.syncCognitiveIndex(entries),
     }, {
       intervalMs: options.intervalMs,
       maxPendingEntries: options.maxPendingEntries,
     });
   }
 
-  setSemanticIndex(index: SemanticMemoryIndex, client: EmbeddingClient): void {
-    this.semanticIndex = index;
+  setCognitiveIndex(index: CognitiveIndex, client: EmbeddingClient): void {
+    this.cognitiveIndex = index;
     this.embeddingClient = client;
   }
 
   async init(): Promise<void> {
     await fs.mkdir(this.memoryDir, { recursive: true });
     await this.loadFromDisk();
-    if (this.semanticIndex) {
-      await this.semanticIndex.init();
+    if (this.cognitiveIndex) {
+      await this.cognitiveIndex.init();
     }
   }
 
@@ -80,9 +80,6 @@ export class PersistedMemory {
     const idx = this.entries.findIndex((e) => e.id === id);
     if (idx === -1) return false;
     this.entries.splice(idx, 1);
-    if (this.semanticIndex) {
-      this.semanticIndex.delete(id);
-    }
     return true;
   }
 
@@ -108,9 +105,6 @@ export class PersistedMemory {
       case "remove": {
         const data = entry.data as { id: string };
         this.entries = this.entries.filter((e) => e.id !== data.id);
-        if (this.semanticIndex) {
-          this.semanticIndex.delete(data.id);
-        }
         break;
       }
       case "update": {
@@ -133,7 +127,7 @@ export class PersistedMemory {
   async getRelevant(query: string, limit: number = 5): Promise<PersistedEntry[]> {
     const now = Date.now();
     
-    // 1. 关键词检索 (同步部分)
+    // 1. 关键词检索
     const keywordResults = this.entries.map((e) => {
       let score = e.importance;
       const ageHours = (now - e.createdAt) / (1000 * 60 * 60);
@@ -142,38 +136,46 @@ export class PersistedMemory {
       const content = e.content.toLowerCase();
       const matches = keywords.filter((k) => content.includes(k)).length;
       score += matches * 0.1;
-      return { entry: e, score };
+      return { entry: e, score, source: "keyword" as const };
     });
 
-    // 2. 语义检索 (异步)
-    let semanticResults: { entry: PersistedEntry, score: number }[] = [];
-    if (this.semanticIndex && this.embeddingClient && query.trim()) {
+    // 2. 向量检索
+    let semanticResults: { entry: PersistedEntry, score: number, source: "vector" }[] = [];
+    if (this.cognitiveIndex && this.embeddingClient && query.trim()) {
       try {
         const queryVector = await this.embeddingClient.getEmbedding(query);
-        const searchHits = this.semanticIndex.search(queryVector, limit * 2);
+        const searchHits = this.cognitiveIndex.searchVector(queryVector, limit * 2);
         semanticResults = searchHits.map(h => ({
           entry: h.entry,
-          score: h.score * 0.8 // 降低语义原始分权重，便于混合
+          score: h.score * 0.8,
+          source: "vector" as const
         }));
       } catch (err) {
-        console.error(`[PersistedMemory] Semantic search failed, falling back to keywords: ${(err as Error).message}`);
+        console.error(`[PersistedMemory] Vector search failed: ${(err as Error).message}`);
       }
     }
 
-    // 3. 混合排序 (Hybrid Rerank)
-    const merged = new Map<string, { entry: PersistedEntry, score: number }>();
-    
-    // 注入关键词分
+    // 3. 经验检索 (v0.5 M1)
+    const practices = this.cognitiveIndex?.getRelatedPractices(query) || [];
+    const practiceResults = practices.map(p => ({
+      id: p.id,
+      content: `[最佳实践] 任务模式: ${p.task_pattern} | 成功路径: ${JSON.parse(p.action_json).join(" -> ")}`,
+      source: "practice",
+      importance: p.confidence,
+      createdAt: p.created_at
+    }));
+
+    // 4. 混合排序 (Hybrid Rerank)
+    const merged = new Map<string, { entry: any, score: number }>();
     keywordResults.forEach(r => merged.set(r.entry.id, r));
-    
-    // 注入或叠加语义分
     semanticResults.forEach(r => {
       const existing = merged.get(r.entry.id);
-      if (existing) {
-        existing.score += r.score; // 叠加
-      } else {
-        merged.set(r.entry.id, r);
-      }
+      if (existing) existing.score += r.score;
+      else merged.set(r.entry.id, r);
+    });
+    
+    practiceResults.forEach(p => {
+       merged.set(p.id, { entry: p, score: 2.0 });
     });
 
     return Array.from(merged.values())
@@ -182,41 +184,34 @@ export class PersistedMemory {
       .map((s) => s.entry);
   }
 
-  async syncSemanticIndex(entries: PersistedEntry[]): Promise<void> {
-    if (!this.semanticIndex || !this.embeddingClient) return;
-
-    // 增量同步逻辑：找出尚未在向量索引中的条目
-    // 简单起见，这里假设 entries 是全量，实际 ProjectionWorker 会传入合并后的 PersistedMemory.entries
-    // 我们只处理没有被索引的新条目（需要一种方式记录已索引状态，暂时用 content 匹配或直接让 semanticIndex 决定）
-    // 为了性能，我们只取最近 replayed 的或者简单的全量 diff
-    
-    // 这里实现一个简单的逻辑：如果索引为空，则全量重建；否则增量处理
-    // (实际应用中应在 SemanticMemoryIndex 记录 last_indexed_at)
-    
-    // 先做最小可行实现：批量处理
+  async syncCognitiveIndex(entries: PersistedEntry[]): Promise<void> {
+    if (!this.cognitiveIndex || !this.embeddingClient) return;
     const batchSize = 10;
-    const entriesToIndex = entries.slice(-batchSize); // 仅处理最近 10 条作为示例
+    const entriesToIndex = entries.slice(-batchSize);
     try {
       const vectors = await this.embeddingClient.getEmbeddings(entriesToIndex.map(e => e.content));
       for (let i = 0; i < entriesToIndex.length; i++) {
-        this.semanticIndex.upsert(entriesToIndex[i], vectors[i]);
+        this.cognitiveIndex.upsertVector(entriesToIndex[i], vectors[i]);
       }
     } catch (err) {
-      console.error(`[PersistedMemory] Async semantic indexing failed: ${(err as Error).message}`);
+      console.error(`[PersistedMemory] Async cognitive indexing failed: ${(err as Error).message}`);
     }
   }
 
-  async rebuildSemanticIndex(): Promise<void> {
-    if (!this.semanticIndex || !this.embeddingClient) return;
-    this.semanticIndex.clear();
-    const batchSize = 10;
-    for (let i = 0; i < this.entries.length; i += batchSize) {
-      const batch = this.entries.slice(i, i + batchSize);
-      const vectors = await this.embeddingClient.getEmbeddings(batch.map(e => e.content));
-      for (let j = 0; j < batch.length; j++) {
-        this.semanticIndex.upsert(batch[j], vectors[j]);
-      }
-    }
+  /** 建立知识关联 */
+  link(source: any, relation: string, target: any): void {
+    this.cognitiveIndex?.link(source, relation, target);
+  }
+
+  /** 记录最佳实践 */
+  addPractice(pattern: string, commands: string[], files: string[], confidence: number = 1.0): void {
+    this.cognitiveIndex?.addPractice({
+      id: "prac_" + Date.now(),
+      task_pattern: pattern,
+      successful_commands: commands,
+      files_involved: files,
+      confidence,
+    });
   }
 
   formatForPrompt(limit: number = 10): string {
@@ -248,10 +243,8 @@ export class PersistedMemory {
 
   async saveToDisk(): Promise<void> {
     if (this.wal) {
-      // WAL 模式：写入 WAL 条目，由 ProjectionWorker 异步投影
       await this.wal.append("compact", this.entries);
     } else {
-      // 传统模式：直接写 memory.json
       const file = path.join(this.memoryDir, "memory.json");
       await fs.writeFile(file, JSON.stringify(this.entries, null, 2), "utf-8");
     }
@@ -296,6 +289,28 @@ export class PersistedMemory {
 
   async forceCheckpoint(): Promise<void> {
     await this.projectionWorker?.forceCheckpoint();
+  }
+
+  async rebuildSemanticIndex(): Promise<void> {
+    if (!this.cognitiveIndex || !this.embeddingClient) return;
+    this.cognitiveIndex.close();
+    await this.cognitiveIndex.init();
+    const batchSize = 10;
+    for (let i = 0; i < this.entries.length; i += batchSize) {
+      const batch = this.entries.slice(i, i + batchSize);
+      const vectors = await this.embeddingClient.getEmbeddings(batch.map(e => e.content));
+      for (let j = 0; j < batch.length; j++) {
+        this.cognitiveIndex.upsertVector(batch[j], vectors[j]);
+      }
+    }
+  }
+
+  async shutdown(): Promise<void> {
+    this.stopProjection();
+    await this.forceCheckpoint();
+    if (this.cognitiveIndex) {
+      this.cognitiveIndex.close();
+    }
   }
 }
 
@@ -405,8 +420,8 @@ export class MemoryStore {
     this.persisted.setWAL(wal, options);
   }
 
-  setSemanticIndex(index: SemanticMemoryIndex, client: EmbeddingClient): void {
-    this.persisted.setSemanticIndex(index, client);
+  setCognitiveIndex(index: CognitiveIndex, client: EmbeddingClient): void {
+    this.persisted.setCognitiveIndex(index, client);
   }
 
   startProjection(): void {
@@ -421,6 +436,10 @@ export class MemoryStore {
     await this.persisted.forceCheckpoint();
   }
 
+  async shutdown(): Promise<void> {
+    await this.persisted.shutdown();
+  }
+
   async rebuildSemanticIndex(): Promise<void> {
     await this.persisted.rebuildSemanticIndex();
   }
@@ -432,6 +451,15 @@ export class MemoryStore {
 
   async getRelevant(query: string, limit: number = 5): Promise<PersistedEntry[]> {
     return this.persisted.getRelevant(query, limit);
+  }
+
+  // --- Cognitive Layer (M1) ---
+  link(source: any, relation: string, target: any): void {
+    this.persisted.link(source, relation, target);
+  }
+
+  addPractice(pattern: string, commands: string[], files: string[]): void {
+    this.persisted.addPractice(pattern, commands, files);
   }
 
   // --- Scratchpad（对外 API）---
@@ -543,7 +571,7 @@ export async function extractDreamMemories(
   return Array.from(new Set(memories));
 }
 
-// --- Token Budget Manager（7.3 节）---
+// --- Token Budget Manager ---
 
 export class TokenBudgetManager {
   maxTokens: number;
@@ -582,7 +610,7 @@ export class TokenBudgetManager {
 
   buildNudgeMessage(): string {
     const pct = Math.round(this.getRemainingPct() * 100);
-    return "Token 预算即将耗尽（剩余 " + pct + "%），请精简回复，减少工具调用。";
+    return "Token 预算即将耗尽（剩余 " + pct + "%），请精简回复，减少工具调用频率。";
   }
 
   estimateMessagesCost(messages: { content: string }[]): number {

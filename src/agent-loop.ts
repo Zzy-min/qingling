@@ -29,6 +29,7 @@ import { checkToolConsistency } from "./pipeline/consistency-checker.js";
 import { DashboardServer } from "./dashboard-server.js";
 import { DiscoveryRegistry } from "./discovery-registry.js";
 import { DiscoverySource } from "./discovery-types.js";
+import { MissionManager } from "./mission/manager.js";
 import { getSkillDirs } from "./tools/skill.js";
 import { listSkills } from "./skills/registry.js";
 import { buildSkillsSection } from "./pipeline/sections.js";
@@ -92,6 +93,7 @@ export class AgentLoop extends AgentEventEmitter {
   private metricsFlushTimer: ReturnType<typeof setInterval> | null = null;
   private dashboardServer: DashboardServer | null = null;
   private discoveryRegistry: DiscoveryRegistry;
+  private missionManager: MissionManager;
   private telemetry: AgentTelemetry | null = null;
   private channel: Channel | null = null;
   private sessionId: string;
@@ -101,6 +103,7 @@ export class AgentLoop extends AgentEventEmitter {
   getWorkflowRuntime(): WorkflowRuntime { return this.workflowRuntime; }
   getMemoryStore(): MemoryStore { return this.memoryStore; }
   getDiscoveryRegistry(): DiscoveryRegistry { return this.discoveryRegistry; }
+  getMissionManager(): MissionManager { return this.missionManager; }
 
   /** 状态机恢复后的内部同步 */
   syncWorkflowState(checkpoint: any): void {
@@ -217,6 +220,7 @@ export class AgentLoop extends AgentEventEmitter {
       // ignore parse errors
     }
     this.discoveryRegistry = new DiscoveryRegistry(discoverySources);
+    this.missionManager = new MissionManager(this.runtimeRootDir);
 
     // HTTP client + retry interceptor
     this.client = axios.create({
@@ -261,6 +265,7 @@ export class AgentLoop extends AgentEventEmitter {
   private async init(): Promise<void> {
     await fs.mkdir(this.runtimeRootDir, { recursive: true });
     await fs.mkdir(this.memoryDir, { recursive: true });
+    await this.missionManager.init();
 
     // v0.3 Sync dynamic discovery
     if (process.env.QINGLING_FEATURES_DYNAMIC_DISCOVERY === "true") {
@@ -306,13 +311,13 @@ export class AgentLoop extends AgentEventEmitter {
         await this.wal.init();
         this.memoryStore.setWAL(this.wal, { intervalMs: projectionInterval });
         
-        // v0.3 语义记忆初始化
+        // v0.3 语义记忆初始化 (v0.5 升级为认知引擎)
         const semanticEnabled = process.env.QINGLING_FEATURES_SEMANTIC_MEMORY === "true";
         if (semanticEnabled) {
-          const { SemanticMemoryIndex } = await import("./memory/semantic-index.js");
+          const { CognitiveIndex } = await import("./memory/cognitive-index.js");
           const { EmbeddingClient } = await import("./memory/embedding.js");
           
-          const semanticIndex = new SemanticMemoryIndex(this.memoryDir);
+          const cognitiveIndex = new CognitiveIndex(this.memoryDir);
           const embeddingClient = new EmbeddingClient({
             apiKey: process.env.QINGLING_MEMORY_SEMANTIC_API_KEY || this.config.apiKey,
             endpoint: process.env.QINGLING_MEMORY_SEMANTIC_ENDPOINT || this.config.endpoint || (this.config.provider === "openai" ? "https://api.openai.com/v1" : "https://api.deepseek.com"),
@@ -320,8 +325,8 @@ export class AgentLoop extends AgentEventEmitter {
             dimensions: Number(process.env.QINGLING_MEMORY_SEMANTIC_DIM) || 1536,
           });
           
-          this.memoryStore.setSemanticIndex(semanticIndex, embeddingClient);
-          console.error("🧠 语义记忆模块已启动 (Hybrid Retrieval Mode)");
+          this.memoryStore.setCognitiveIndex(cognitiveIndex, embeddingClient);
+          console.error("🧠 认知引擎模块已启动 (Triple-Path Retrieval Mode)");
         }
 
         this.memoryStore.startProjection();
@@ -339,9 +344,11 @@ export class AgentLoop extends AgentEventEmitter {
       // ignore
     }
 
-    // Metrics initialization
+    // Metrics & Dashboard initialization
     const metricsEnabled = process.env.QINGLING_METRICS_ENABLED === "true";
-    if (metricsEnabled) {
+    const dashboardEnabled = process.env.QINGLING_FEATURES_DASHBOARD === "true";
+
+    if (metricsEnabled || dashboardEnabled) {
       try {
         const metricsDir = path.resolve(
           process.env.QINGLING_METRICS_DIR ?? path.join(this.runtimeRootDir, "metrics")
@@ -351,24 +358,32 @@ export class AgentLoop extends AgentEventEmitter {
           Number.isFinite(flushIntervalRaw) && flushIntervalRaw > 0
             ? flushIntervalRaw
             : 10000;
+        
         this.metricsCollector = new MetricsCollector(metricsDir, this.sessionId, flushIntervalMs);
         await this.metricsCollector.init();
         this.metricsFlushTimer = this.metricsCollector.startAutoFlush();
         this.telemetry = new AgentTelemetry(this.metricsCollector, this.sessionId);
-        console.error("[Metrics] enabled, dir=" + metricsDir);
+        
+        if (metricsEnabled) {
+          console.error("[Metrics] enabled, dir=" + metricsDir);
+        }
 
         // v0.3 Dashboard Server
-        if (process.env.QINGLING_FEATURES_DASHBOARD === "true") {
+        if (dashboardEnabled) {
           this.dashboardServer = new DashboardServer({
             port: Number(process.env.QINGLING_DASHBOARD_PORT) || 9999,
             collector: this.metricsCollector,
             workflowRuntime: this.workflowRuntime,
             agentLoop: this,
           });
-          this.dashboardServer.start();
+          try {
+            await this.dashboardServer.start();
+          } catch (serverErr: any) {
+            console.warn(`⚠️ Dashboard 启动跳过: ${serverErr.message}`);
+          }
         }
       } catch (err) {
-        console.error("[Metrics] init failed: " + (err as Error).message);
+        console.error("[Metrics/Dashboard] init failed: " + (err as Error).message);
       }
     }
 
@@ -569,6 +584,28 @@ export class AgentLoop extends AgentEventEmitter {
         const tc = prepared.call;
         turnToolCalls++;
 
+        // v0.5 M2: Self-Reflective Loop (Inner Monologue)
+        // 针对高风险工具进行预演评估
+        if (tc.name === "write" || tc.name === "bash") {
+          const reflection = await this.reflectiveThink(tc);
+          if (reflection.decision === "block") {
+            console.error(`🚨 [内省阻断] ${reflection.reason}`);
+            this.messages.push({
+              role: "tool",
+              content: JSON.stringify({
+                tool_call_id: tc.id,
+                output: `Error: [REFLECTION_BLOCKED] ${reflection.reason}. This action was deemed too risky.`,
+                is_error: true,
+              }),
+              tool_call_id: tc.id,
+            });
+            turnToolFailures++;
+            continue;
+          } else if (reflection.decision === "warn") {
+            console.error(`💭 [内省警告] ${reflection.reason}`);
+          }
+        }
+
         // v0.3 Tool Spec Boost: Consistency Check
         if (process.env.QINGLING_FEATURES_TOOL_SPEC_BOOST === "true") {
           const def = this.config.tools.find(t => t.name === tc.name);
@@ -767,8 +804,10 @@ export class AgentLoop extends AgentEventEmitter {
     if (this.mcpRegistry) {
       await this.mcpRegistry.disconnectAll();
     }
-    this.memoryStore.stopProjection();
-    await this.memoryStore.forceCheckpoint();
+    if (this.dashboardServer) {
+      this.dashboardServer.stop();
+    }
+    await this.memoryStore.shutdown();
     if (this.wal) {
       await this.wal.close();
     }
@@ -824,6 +863,32 @@ export class AgentLoop extends AgentEventEmitter {
 
   // --- Private Methods ---
 
+  /** 自我反思循环 (v0.5 M2) */
+  private async reflectiveThink(tc: ToolCall): Promise<{ decision: "proceed" | "ask" | "block" | "warn", reason: string }> {
+    const { buildReflectionPrompt } = await import("./pipeline/sections.js");
+    const prompt = buildReflectionPrompt(tc.name, tc.arguments);
+    
+    try {
+      // 执行一次极简的内部调用进行风险评估
+      const resp = await this.chat(prompt, { max_tokens: 200, temperature: 0 });
+      // 提取 JSON（防止模型输出冗余文字）
+      const jsonStr = resp.content.match(/\{[\s\S]*\}/)?.[0] || "{}";
+      const analysis = JSON.parse(jsonStr);
+      return {
+        decision: analysis.decision || "proceed",
+        reason: analysis.reason || "评估完成。"
+      };
+    } catch {
+      // 降级：启发式检查
+      const args = tc.arguments as any;
+      const cmd = (args.cmd || args.command || "").toLowerCase();
+      if (cmd.includes("rm ") || cmd.includes("del ")) {
+        return { decision: "warn", reason: "启发式拦截：检测到可能的删除操作。" };
+      }
+      return { decision: "proceed", reason: "启发式通过。" };
+    }
+  }
+
   private async buildSystemPrompt(): Promise<string> {
     // 更新 token budget section
     const budgetSec = this.sectionRegistry.get(SECTION_IDS.TOKEN_BUDGET);
@@ -871,7 +936,7 @@ export class AgentLoop extends AgentEventEmitter {
     return parts.join("\n\n");
   }
 
-  private async chat(systemPrompt: string): Promise<{
+  private async chat(systemPrompt: string, overrides: Record<string, any> = {}): Promise<{
     content: string;
     tool_calls?: RawToolCall[];
   }> {
@@ -888,6 +953,7 @@ export class AgentLoop extends AgentEventEmitter {
         },
       })),
       stream: false,
+      ...overrides,
     };
 
     await this.maybeDumpInspect("prompt", {

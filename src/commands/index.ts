@@ -3,12 +3,18 @@ import { helpCommand } from "./help.js";
 import { clearCommand } from "./clear.js";
 import { statusCommand } from "./status.js";
 import { skillCommand } from "./skill.js";
+import { dashboardCommand } from "./dashboard.js";
+import { configCommand } from "./config.js";
+import { detachCommand } from "./detach.js";
 
 export const COMMANDS: SlashCommand[] = [
   helpCommand,
   clearCommand,
   statusCommand,
   skillCommand,
+  dashboardCommand,
+  configCommand,
+  detachCommand,
 ];
 
 export async function handleSlashCommand(input: string, agentLoop: any): Promise<boolean> {

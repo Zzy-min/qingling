@@ -1,6 +1,6 @@
 import type { CliGlobalOptions } from "../config.js";
 
-export type CliMode = "help" | "run" | "chat" | "repl" | "workflow" | "memory" | "dashboard" | "discovery" | "setup";
+export type CliMode = "help" | "run" | "chat" | "repl" | "workflow" | "memory" | "dashboard" | "discovery" | "setup" | "mission";
 
 export interface CliResolutionOk {
   kind: "ok";
@@ -45,10 +45,10 @@ export function parseCliArgs(args: string[]): CliResolution {
     }
 
     if (!arg.startsWith("-") && modeFromSubcommand === null && positional.length === 0) {
-      const knownModes = ["run", "chat", "repl", "workflow", "memory", "dashboard", "discovery", "setup"];
+      const knownModes = ["run", "chat", "repl", "workflow", "memory", "dashboard", "discovery", "setup", "mission"];
       if (knownModes.includes(arg)) {
         modeFromSubcommand = arg as CliMode;
-        if (["workflow", "memory", "dashboard", "discovery", "setup"].includes(arg)) {
+        if (["workflow", "memory", "dashboard", "discovery", "setup", "mission"].includes(arg)) {
           subArgs.push(...args.slice(i + 1));
           break;
         }
@@ -159,7 +159,7 @@ export function parseCliArgs(args: string[]): CliResolution {
     return { kind: "ok", mode: "run", task, subArgs: [], global, warnings };
   }
 
-  if (["workflow", "memory", "dashboard", "discovery", "setup"].includes(modeFromSubcommand || "")) {
+  if (["workflow", "memory", "dashboard", "discovery", "setup", "mission"].includes(modeFromSubcommand || "")) {
     return { kind: "ok", mode: modeFromSubcommand!, subArgs, global, warnings };
   }
 
@@ -239,6 +239,11 @@ ${binName} - 通用 CLI Agent
   ${binName} memory reindex [--full]  # 重新构建语义记忆向量索引
   ${binName} dashboard start [--port] # 启动本地白盒化观测控制台
   ${binName} discovery sync           # 同步动态插件与技能
+
+使命管理 (v0.5 M2):
+  ${binName} mission start "任务"      # 开启一个后台使命
+  ${binName} mission list             # 列出当前所有使命
+  ${binName} mission logs <id>        # 查看特定使命日志
   ${binName} --help                   # 显示帮助
 
 全局参数:
